@@ -19,12 +19,13 @@ using UnityEngine.Video;
 public class HandTracking : MonoBehaviour 
 {
     [Tooltip("Configurable TFLite model.")]
+    public int InputW = 256;
+    public int InputH = 256;
     public TextAsset PalmDetection;
     public TextAsset HandLandmark3D;
 
     private RenderTexture videoTexture;
     private Texture2D texture;
-    private float videoWidth, videoHeight;
     private bool isPosing = false;
 
     private Inferencer inferencer = new Inferencer();
@@ -52,88 +53,49 @@ public class HandTracking : MonoBehaviour
         renderer.material.mainTexture = videoTexture;
         videoPlayer.Play();
 
-        texture = new Texture2D(videoTexture.width, videoTexture.height);
-        videoWidth = texture.width;
-        videoHeight = texture.height;
+        texture = new Texture2D(videoTexture.width, videoTexture.height, TextureFormat.RGB24, false);
      }
 
     void Update() 
     {
-        UpdateTexture();
-
         if (isPosing) { return; }
         isPosing = true;
         StartCoroutine("UpdateInferencer", texture);
     }
 
-    private void UpdateTexture()
-    { 
+    IEnumerator UpdateInferencer(Texture2D texture) 
+    {
         Graphics.SetRenderTarget(videoTexture);
         texture.ReadPixels(new Rect(0, 0, videoTexture.width, videoTexture.height), 0, 0);
         texture.Apply();
         Graphics.SetRenderTarget(null);
-    }
 
-    IEnumerator UpdateInferencer(Texture2D texture) 
-    {
-        int width = inferencer.InputWidth;
-        int height = inferencer.InputHeight;
-        Texture2D resizedTexture = ResizeTexture(texture, width, height);
-
-        inferencer.Update(resizedTexture);
-
-        Destroy(resizedTexture);
+        inferencer.Update(texture);
 
         isPosing = false;
         yield return null;
     }
 
-    private Texture2D ResizeTexture(Texture2D src, int width, int height) 
+    public void OnRenderObject() 
     {
-        float videoShortSide = (videoWidth > videoHeight) ? videoHeight : videoWidth;
-        float aspectWidth = videoWidth / videoShortSide;
-        float aspectHeight = videoHeight / videoShortSide;
-
-        src.filterMode = FilterMode.Trilinear;
-        src.Apply(true);
-
-        RenderTexture rt = new RenderTexture(width, height, 32);
-        Graphics.SetRenderTarget(rt);
-        GL.LoadPixelMatrix(0, aspectWidth, 0, aspectHeight);
-        //RotateTexture();
-        GL.Clear(true, true, new Color(0, 0, 0, 0));
-        Graphics.DrawTexture(new Rect(0, 0, aspectWidth, aspectHeight), src);
-
-        Rect rect = new Rect(0, 0, width, height);
-        Texture2D dst = new Texture2D((int)rect.width, (int)rect.height, TextureFormat.ARGB32, true);
-        dst.ReadPixels(rect, 0, 0, true);
-        Graphics.SetRenderTarget(null);
-        Destroy(rt);
-
-        return dst;
-    }
-
-    private void RotateTexture()
-    {
-        Vector3 t = new Vector3(0, 1, 0);
-        Quaternion r = Quaternion.Euler(0, 0, -90);
-        Vector3 s = Vector3.one;
-        Matrix4x4 m = Matrix4x4.identity;
-        m.SetTRS(t, r, s);
-        GL.MultMatrix(m);
-    }
-
-    public void OnRenderObject() {
         if (!inferencer.Initialized){ return; }
 
-        //var inputs = inferencer.Inputs;
-        //renderer.DrawInput(inputs);
+        var palmDetectionInputs = inferencer.PalmDetectionInputs;
+        //renderer.DrawInput(palmDetectionInputs);
 
         var palmBox = inferencer.PalmBox;
         var palmKeypoints = inferencer.PalmKeypoints;
+        var handBox = inferencer.HandBox;
+        var handCenter = inferencer.HandCenter;
         //Debug.Log(string.Format("Palm box {0:0.0}, {1:0.0}, {2:0.0}, {3:0.0}", palmBox.x, palmBox.y, palmBox.width, palmBox.height));
-        renderer.DrawPalm(palmBox, palmKeypoints);
+        //renderer.DrawPalm(palmBox, palmKeypoints, handBox, handCenter);
+
+        var handLandmarksInputs = inferencer.HandLandmarksInputs;
+        //renderer.DrawInput(handLandmarksInputs);
+
+        var handLandmarks = inferencer.HandLandmarks;
+        renderer.DrawHand(handLandmarks);
     }
 
-    void OnDestroy() { inferencer.Destroy(); }
+    void OnDestroy(){ inferencer.Destroy(); }
 }

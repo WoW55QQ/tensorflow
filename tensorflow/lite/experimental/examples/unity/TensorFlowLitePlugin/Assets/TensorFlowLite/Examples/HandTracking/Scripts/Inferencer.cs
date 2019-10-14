@@ -18,7 +18,8 @@ using UnityEngine;
 
 using static UnityEngine.Mathf;
 
-// https://github.com/google/mediapipe/blob/master/mediapipe/graphs/hand_tracking/hand_detection_gpu.pbtxt
+// Ref: https://github.com/google/mediapipe/blob/master/mediapipe/graphs/hand_tracking/subgraphs/hand_detection_gpu.pbtxt
+// Ref: https://github.com/google/mediapipe/blob/master/mediapipe/graphs/hand_tracking/subgraphs/hand_landmark_gpu.pbtxt
 public class Inferencer 
 {
     private const int NN_INPUT_WIDTH = 256;
@@ -26,34 +27,42 @@ public class Inferencer
     private const int NN_INPUT_CHANNEL = 3;
     private const int NN_NUM_CLASSES = 1;
     private const int NN_NUM_BOXES = 2944;
+    private const int NN_NUM_BOX_SIZE = 4;
     private const int NN_NUM_COORDS = 18; // box(x,y,z,w) + keypoints(x,y) * 7
     private const int NN_NUM_KEYPOINTS = 7;
+    private const int NN_NUM_VALUES_PERKEYPOINT = 2;
+    private const int NN_NUM_KEYPOINTS_SIZE = NN_NUM_KEYPOINTS * NN_NUM_VALUES_PERKEYPOINT;
 
-    private const int NN_NUM_KEYPOINTS_3D = 21;
+    private const int NN_NUM_LANDMARKS = 21;
 
     private Interpreter palmDetectionInterpreter;
-    private Interpreter handLandmark3DInterpreter;
+    private Interpreter handLandmarksInterpreter;
 
-    private float[,,,] inputs = new float[1, NN_INPUT_HEIGHT, NN_INPUT_WIDTH, NN_INPUT_CHANNEL];
-    private float[,] anchors = new float[NN_NUM_BOXES, 4];
-    private float[,,] regressors = new float[1, NN_NUM_BOXES, NN_NUM_COORDS];
-    private float[,,] classificators = new float[1, NN_NUM_BOXES, NN_NUM_CLASSES];
-    private float[,] keypoints3d = new float[1, NN_NUM_KEYPOINTS_3D * 3];
+    private float[,,,] palmDetectionInputs = new float[1, NN_INPUT_HEIGHT, NN_INPUT_WIDTH, NN_INPUT_CHANNEL];
+    private float[,,,] handLandmarksInputs = new float[1, NN_INPUT_HEIGHT, NN_INPUT_WIDTH, NN_INPUT_CHANNEL];
+
+    private float[,] anchorsOutputs = new float[NN_NUM_BOXES, NN_NUM_BOX_SIZE];
+    private float[,,] regressorsOutputs = new float[1, NN_NUM_BOXES, NN_NUM_COORDS];
+    private float[,,] classificatorsOutputs = new float[1, NN_NUM_BOXES, NN_NUM_CLASSES];
+    private float[,] landmarksOutputs = new float[1, NN_NUM_LANDMARKS * 3];
+    private float[,] handFlagOutputs = new float[1, 1];
 
     public bool Initialized = false;
     public int InputWidth { get { return NN_INPUT_WIDTH; } }
     public int InputHeight { get { return NN_INPUT_HEIGHT; } }
-    public float[,,,] Inputs { get { return inputs; } }
+    public float[,,,] PalmDetectionInputs { get { return palmDetectionInputs; } }
     public int PalmNumKeypoints { get { return NN_NUM_KEYPOINTS; } }
+    public float[,,,] HandLandmarksInputs { get { return handLandmarksInputs; } }
 
     public Rect PalmBox = new Rect();
     public Vector2[] PalmKeypoints = new Vector2[NN_NUM_KEYPOINTS];
+    public Vector3[] HandLandmarks = new Vector3[NN_NUM_LANDMARKS];
 
-    public void Init(TextAsset palmDetection, TextAsset handLandmark3D) 
+    public void Init(TextAsset palmDetection, TextAsset handLandmarks) 
     {
         palmDetectionInterpreter = InitInterpreter(palmDetection);
-        handLandmark3DInterpreter = InitInterpreter(handLandmark3D);
-        InitAnchors(anchors, NN_INPUT_WIDTH, NN_INPUT_HEIGHT);
+        handLandmarksInterpreter = InitInterpreter(handLandmarks);
+        InitAnchors(anchorsOutputs, NN_INPUT_WIDTH, NN_INPUT_HEIGHT);
     }
     private Interpreter InitInterpreter(TextAsset model)
     { 
@@ -82,25 +91,27 @@ public class Inferencer
 
     private void InitAnchors(float[,] anchors, int width, int height)
     {
-        const int NN_NUM_LAYERS = 5;
-        const float NN_ANCHOR_OFFSET_X = 0.5f;
-        const float NN_ANCHOR_OFFSET_Y = 0.5f;
-        int[] NN_STRIDES = { 8, 16, 32, 32, 32 };
+        const int SSD_NUM_LAYERS = 5;
+        const float SSD_ANCHOR_OFFSET_X = 0.5f;
+        const float SSD_ANCHOR_OFFSET_Y = 0.5f;
+        int[] SSD_STRIDES = { 8, 16, 32, 32, 32 };
 
         int index = 0;
-        for(int layer = 0; layer < NN_NUM_LAYERS; ++layer)
+        for(int layer = 0; layer < SSD_NUM_LAYERS; ++layer)
         {
-            float stride = NN_STRIDES[layer];
+            float stride = SSD_STRIDES[layer];
             int featureMapHeight = CeilToInt(width / stride);
             int featureMapWidth = CeilToInt(height / stride);
             for(int y = 0; y < featureMapHeight; ++y)
             {
+                float centerY = (y + SSD_ANCHOR_OFFSET_Y) / featureMapHeight;
                 for(int x = 0; x < featureMapWidth; ++x)
                 {
-                    for(int aspectRatios = 0; aspectRatios < 2; ++aspectRatios)
+                    float centerX = (x + SSD_ANCHOR_OFFSET_X) / featureMapWidth;
+                    for(int anchorID = 0; anchorID < 2; ++anchorID)
                     { 
-                        anchors[index, 0] = (x + NN_ANCHOR_OFFSET_X) / featureMapWidth;
-                        anchors[index, 1] = (y + NN_ANCHOR_OFFSET_Y) / featureMapHeight;
+                        anchors[index, 0] = centerX;
+                        anchors[index, 1] = centerY;
                         anchors[index, 2] = 1.0f;
                         anchors[index, 3] = 1.0f;
                         ++index;
@@ -112,110 +123,310 @@ public class Inferencer
 
     public void Update(Texture2D texture) 
     {
-        UpdateShapes(texture);
-        UpdatePalmDetection();
+        var size = new Vector2(texture.width, texture.height);
+        var center = new Vector2(size.x * 0.5f, texture.height * 0.5f);
+        var angle = 0.0f * Deg2Rad;
+        CreateShapes(texture, palmDetectionInputs, size, center, angle);
+        DetectePalmRect();
+        CalcPalmRect();
+        CalcHandRect();
+
+        debugHandLandmarks = true;
+        CreateShapes(texture, handLandmarksInputs, HandSize, HandCenter, handAngle);
+        DetecteLandmarksPos();
+        CalcLandmarksPos();
+        debugHandLandmarks = false;
 
         Initialized = true;
     }
-    
-    private unsafe void UpdateShapes(Texture2D texture) 
+
+    private bool debugHandLandmarks = false;
+    private bool shapeFlipX = true;
+    private bool shapeFlipY = true;
+
+    private unsafe void CreateShapes(Texture2D texture, float[,,,] inputs,
+                                        Vector2 size, Vector2 center, float angle) 
     {
-        const int ARGB = 4, A = 1;
+        const int RGB = 3; // TextureFormat.RGB24
         const float ItoF = 1.0f / 255.0f;
 
         byte[] pixels = texture.GetRawTextureData();
-        
+
+        int srcW = texture.width, srcH = texture.height; 
+        int dstW = NN_INPUT_WIDTH, dstH = NN_INPUT_HEIGHT; 
+        float cropW = size.x, cropH = size.y;
+        float scaleW = (float)dstW / srcW, scaleH = (float)dstH / srcH; 
+
+        float longSide = (srcW >= srcH) ? srcW : srcH; 
+        float padScaleW = srcW / longSide, padScaleH = srcH / longSide; 
+        int dstPadW = FloorToInt((longSide - srcW) * padScaleW * scaleW * 0.5f); 
+        int dstPadH = FloorToInt((longSide - srcH) * padScaleH * scaleH * 0.5f); 
+
+        float srcHalfX = (cropW * 0.5f), srcHalfY = (cropH * 0.5f);
+        float c = Cos(angle), s = Sin(angle);
+
         Array.Clear(inputs, 0, inputs.Length);
         fixed (byte* src = pixels) 
         {
-            for (int y = 0; y < NN_INPUT_HEIGHT; ++y) 
+            float invDstH = 1.0f / (dstH - dstPadH * 2.0f);
+            for (int dstY = dstPadH; dstY < dstH - dstPadH; ++dstY) 
             {
-                int srcHeight = y * NN_INPUT_WIDTH;
-                for (int x = 0; x < NN_INPUT_WIDTH; ++x) 
-                {
-                    int flipedX = (NN_INPUT_WIDTH - 1) - x;
-                    int srcWidth = flipedX;
-                    byte* srcPos = src + (srcHeight + srcWidth) * ARGB + A;
+                float dstV = (dstY - dstPadH) * invDstH;
+                float srcLocalY = (cropH * dstV) - srcHalfY;
+                float invDstW = 1.0f / (dstW - dstPadW * 2.0f);
 
+                for (int dstX = dstPadW; dstX < dstW - dstPadW; ++dstX) 
+                {
+                    float dstU = (dstX - dstPadW) * invDstW;
+                    float srcLocalX = (cropW * dstU) - srcHalfX;
+                    int srcGlobalX = FloorToInt(center.x + (srcLocalX * c - srcLocalY * s));
+                    int srcGlobalY = FloorToInt(center.y + (srcLocalX * s + srcLocalY * c));
+
+                    int srcX = shapeFlipX ? (srcW - 1) - srcGlobalX : srcGlobalX;
+                    int srcY = shapeFlipY ? (srcH - 1) - srcGlobalY : srcGlobalY;
+                    if(srcX < 0 || srcX >= srcW) { continue; }
+                    if(srcY < 0 || srcY >= srcH) { continue; }
+
+                    byte* srcPos = src + (srcY * srcW + srcX) * RGB;
                     byte r = *(srcPos++);
                     byte g = *(srcPos++);
                     byte b = *(srcPos++);
-                    inputs[0, y, x, 0] = r * ItoF;
-                    inputs[0, y, x, 1] = g * ItoF;
-                    inputs[0, y, x, 2] = b * ItoF;
+                    // Image inputs are normalized to [-1,1]
+                    inputs[0, dstY, dstX, 0] = (r * ItoF * 2.0f) - 1.0f;
+                    inputs[0, dstY, dstX, 1] = (g * ItoF * 2.0f) - 1.0f;
+                    inputs[0, dstY, dstX, 2] = (b * ItoF * 2.0f) - 1.0f;
                 }
             }
         }
     }
 
-    private void UpdatePalmDetection() 
+    private float[] palmScoreCandidates = new float[NN_NUM_BOXES];
+    private float[,] palmBoxCandidates = new float[NN_NUM_BOXES, NN_NUM_BOX_SIZE];
+    private float[,,] palmKeypointsCandidates = new float[NN_NUM_BOXES, NN_NUM_KEYPOINTS, NN_NUM_VALUES_PERKEYPOINT];
+    private float[,] palmBoxMaxScore = new float[1, NN_NUM_BOX_SIZE];
+
+    private void DetectePalmRect() 
     { 
         const int NN_BOX_COORD_OFFSET = 0;
         const int NN_KEYPOINT_COORD_OFFSET = 4;
-        const int NN_NUM_VALUES_PERKEYPOINT = 2;
         const float NN_SCORE_CLIPPING_THRESH = 100.0f;
         const float NN_MIN_SCORE_THRESH = 0.7f;
-        const float NN_X_SCALE = 256.0f;
-        const float NN_Y_SCALE = 256.0f;
-        const float NN_H_SCALE = 256.0f;
-        const float NN_W_SCALE = 256.0f;
+        const float NN_X_SCALE = 256.0f, NN_Y_SCALE = 256.0f;
+        const float NN_H_SCALE = 256.0f, NN_W_SCALE = 256.0f;
+        const int X = 0, Y = 1, W = 2, H = 3;
 
-        palmDetectionInterpreter.SetInputTensorData(0, inputs);
+        palmDetectionInterpreter.SetInputTensorData(0, palmDetectionInputs);
 
-        //float startTimeSeconds = Time.realtimeSinceStartup;
+        float startTimeSeconds = Time.realtimeSinceStartup;
         palmDetectionInterpreter.Invoke();
-        //float inferenceTimeSeconds = (Time.realtimeSinceStartup - startTimeSeconds) * 10000;
+        float inferenceTimeSeconds = (Time.realtimeSinceStartup - startTimeSeconds) * 10000;
         //Debug.Log(string.Format("Palm detection {0:0.0000} ms", inferenceTimeSeconds));
 
-        Array.Clear(regressors, 0, regressors.Length);
-        palmDetectionInterpreter.GetOutputTensorData(0, regressors);
-        Array.Clear(classificators, 0, classificators.Length);
-        palmDetectionInterpreter.GetOutputTensorData(1, classificators);
+        Array.Clear(regressorsOutputs, 0, regressorsOutputs.Length);
+        palmDetectionInterpreter.GetOutputTensorData(0, regressorsOutputs);
+        Array.Clear(classificatorsOutputs, 0, classificatorsOutputs.Length);
+        palmDetectionInterpreter.GetOutputTensorData(1, classificatorsOutputs);
+
+        Array.Clear(palmScoreCandidates, 0, palmScoreCandidates.Length);
+        Array.Clear(palmBoxCandidates, 0, palmBoxCandidates.Length);
+        Array.Clear(palmKeypointsCandidates, 0, palmKeypointsCandidates.Length);
 
         float maxScore = -1.0f;
         for(int i = 0; i < NN_NUM_BOXES; ++i)
         {
-            float score = classificators[0, i, 0];
+            float score = classificatorsOutputs[0, i, 0];
             score = Clamp(score, -NN_SCORE_CLIPPING_THRESH, NN_SCORE_CLIPPING_THRESH);
             score = Sigmoid(score);
+
             if(score < NN_MIN_SCORE_THRESH){ continue; }
-            if(score < maxScore){ continue; }
-            maxScore = score;
+            palmScoreCandidates[i] = score;
 
-            float centerX = regressors[0, i, NN_BOX_COORD_OFFSET + 0];
-            float centerY = regressors[0, i, NN_BOX_COORD_OFFSET + 1];
-            float w = regressors[0, i, NN_BOX_COORD_OFFSET + 2];
-            float h = regressors[0, i, NN_BOX_COORD_OFFSET + 3];
+            float centerX = regressorsOutputs[0, i, NN_BOX_COORD_OFFSET + 0];
+            float centerY = regressorsOutputs[0, i, NN_BOX_COORD_OFFSET + 1];
+            float w = regressorsOutputs[0, i, NN_BOX_COORD_OFFSET + 2];
+            float h = regressorsOutputs[0, i, NN_BOX_COORD_OFFSET + 3];
 
-            centerX = centerX / NN_X_SCALE * anchors[i, 2] + anchors[i, 0];
-            centerY = centerY / NN_Y_SCALE * anchors[i, 3] + anchors[i, 1];
-            w = w / NN_W_SCALE * anchors[i, 2];
-            h = h / NN_H_SCALE * anchors[i, 3];
+            // anchors[i, 2] and anchors[i, 3] are always 1.0f
+            centerX = centerX / NN_X_SCALE * anchorsOutputs[i, 2] + anchorsOutputs[i, 0];
+            centerY = centerY / NN_Y_SCALE * anchorsOutputs[i, 3] + anchorsOutputs[i, 1];
+            w = w / NN_W_SCALE * anchorsOutputs[i, 2];
+            h = h / NN_H_SCALE * anchorsOutputs[i, 3];
 
-            float boxMinY = centerY - h / 2.0f;
-            float boxMinX = centerX - w / 2.0f;
-            float boxMaxY = centerY + h / 2.0f;
-            float boxMaxX = centerX + w / 2.0f;
-            PalmBox.Set(boxMinX, boxMinY, boxMaxX - boxMinX, boxMaxY - boxMinY);
+            float boxMinY = centerY - h * 0.5f, boxMinX = centerX - w * 0.5f;
+            float boxMaxY = centerY + h * 0.5f, boxMaxX = centerX + w * 0.5f;
+            palmBoxCandidates[i, X] = boxMinX;
+            palmBoxCandidates[i, Y] = boxMinY;
+            palmBoxCandidates[i, W] = boxMaxX - boxMinX;
+            palmBoxCandidates[i, H] = boxMaxY - boxMinY;
 
-            int jMax = NN_NUM_KEYPOINTS;
-            for(int j = 0; j < jMax; ++j)
+            for(int j = 0; j < NN_NUM_KEYPOINTS; ++j)
             { 
                 int ofset = NN_BOX_COORD_OFFSET + NN_KEYPOINT_COORD_OFFSET + j * NN_NUM_VALUES_PERKEYPOINT;
-                float keypointX = regressors[0, i, ofset + 0];
-                float keypointY = regressors[0, i, ofset + 1];
-                keypointX = keypointX / NN_X_SCALE * anchors[i, 2] + anchors[i, 0];
-                keypointY = keypointY / NN_Y_SCALE * anchors[i, 3] + anchors[i, 1];
-                PalmKeypoints[j].Set(keypointX, keypointY);
+                float keypointX = regressorsOutputs[0, i, ofset + 0];
+                float keypointY = regressorsOutputs[0, i, ofset + 1];
+                keypointX = keypointX / NN_X_SCALE * anchorsOutputs[i, 2] + anchorsOutputs[i, 0];
+                keypointY = keypointY / NN_Y_SCALE * anchorsOutputs[i, 3] + anchorsOutputs[i, 1];
+                palmKeypointsCandidates[i, j, 0] = keypointX;
+                palmKeypointsCandidates[i, j, 1] = keypointY;
             }
+
+            if(score < maxScore){ continue; }
+            maxScore = score;
+            Array.Copy(palmBoxCandidates, i * NN_NUM_BOX_SIZE, palmBoxMaxScore, 0, NN_NUM_BOX_SIZE);
+        }
+    }
+    private float Sigmoid(float x){ return 1.0f / (1.0f + Exp(-x)); }
+
+    private void CalcPalmRect() 
+    { 
+        const float MIN_SUPPRESSION_THRESHOLD = 0.3f;
+        const int X = 0, Y = 1, W = 2, H = 3;
+
+        float[,] boxCandidate = new float[1, NN_NUM_BOX_SIZE];
+        float totalScore = 0.0f;
+        float[] totalBox = new float[NN_NUM_BOX_SIZE];
+        float[,] totalKeypoints = new float[NN_NUM_KEYPOINTS, NN_NUM_VALUES_PERKEYPOINT];
+        for(int i = 0; i < NN_NUM_BOXES; ++i)
+        {
+            Array.Copy(palmBoxCandidates, i * NN_NUM_BOX_SIZE, boxCandidate, 0, NN_NUM_BOX_SIZE);
+            float similarity = OverlapSimilarity(palmBoxMaxScore, boxCandidate);
+            if (similarity < MIN_SUPPRESSION_THRESHOLD) { continue; }
+
+            float score = palmScoreCandidates[i];
+            totalScore += score;
+            totalBox[X] += palmBoxCandidates[i, X] * score;
+            totalBox[Y] += palmBoxCandidates[i, Y] * score;
+            totalBox[W] += palmBoxCandidates[i, W] * score;
+            totalBox[H] += palmBoxCandidates[i, H] * score;
+            for(int j = 0; j < NN_NUM_KEYPOINTS; ++j)
+            {
+                totalKeypoints[j, 0] += palmKeypointsCandidates[i, j, 0] * score;
+                totalKeypoints[j, 1] += palmKeypointsCandidates[i, j, 1] * score;
+            }
+        }
+
+        if(totalScore == 0.0f) { return; }
+        float invTotalScore = 1.0f / totalScore;
+        PalmBox.Set(totalBox[X] * invTotalScore, totalBox[Y] * invTotalScore, 
+                    totalBox[W] * invTotalScore, totalBox[H] * invTotalScore);
+
+        for(int i = 0; i < NN_NUM_KEYPOINTS; ++i)
+        {
+            PalmKeypoints[i].Set(totalKeypoints[i, 0] * invTotalScore, 
+                                    totalKeypoints[i, 1] * invTotalScore);
+        }
+    }
+    private float OverlapSimilarity(float[,] a, float[,] b) 
+    {
+        const int X = 0, Y = 1, W = 2, H = 3;
+        float minX = Max(a[0, X], b[0, X]), maxX = Min(a[0, X] + a[0, W], b[0, X] + b[0, W]);
+        float minY = Max(a[0, Y], b[0, Y]), maxY = Min(a[0, Y] + a[0, H], b[0, Y] + b[0, H]);
+        if (minX > maxX || minY > maxY) { return 0.0f; }
+
+        float aArea = a[0, W] * a[0, H], bArea = b[0, W] * b[0, H];
+        float intersectionArea = (maxX - minX) * (maxY - minY);
+        float normalization = aArea + bArea - intersectionArea;
+        if(normalization == 0.0f) { return 0.0f; }
+
+        return intersectionArea / normalization;
+    }
+ 
+    public Vector2[] HandBox = new Vector2[NN_NUM_BOX_SIZE];
+    public Vector2 HandSize, HandCenter;
+    private float handAngle = 0.0f;
+    private float handCos = 0.0f, handSin = 0.0f;
+    private void CalcHandRect() 
+    { 
+        const int START_KEYPOINT = 0; // Center of wrist.
+        const int END_KEYPOINT = 2; // MCP of middle finger.
+        const float ANGLE = PI * 90.0f / 180.0f;
+        const float SCALE_X = 2.6f, SCALE_Y = 2.6f;
+        const float SHIFT_X = 0.0f, SHIFT_Y = -0.5f;
+
+        float startX = PalmKeypoints[START_KEYPOINT].x * NN_INPUT_WIDTH;
+        float startY = PalmKeypoints[START_KEYPOINT].y * NN_INPUT_HEIGHT;
+        float endX = PalmKeypoints[END_KEYPOINT].x * NN_INPUT_WIDTH;
+        float endY = PalmKeypoints[END_KEYPOINT].y * NN_INPUT_HEIGHT;
+        float angle = ANGLE - Atan2(-(endY - startY), endX - startX);
+        handAngle = angle - 2.0f * PI * Floor((angle - (-PI)) / (2.0f * PI));
+        handCos = Cos(handAngle);
+        handSin = Sin(handAngle);
+
+        float w = NN_INPUT_WIDTH * PalmBox.width;
+        float h = NN_INPUT_HEIGHT * PalmBox.height;
+
+        float centerX = (PalmBox.x + PalmBox.width * 0.5f) * NN_INPUT_WIDTH;
+        float centerY = (PalmBox.y + PalmBox.height * 0.5f) * NN_INPUT_HEIGHT;
+        if (handAngle == 0.0f) 
+        {
+            centerX += w * SHIFT_X;
+            centerY += h * SHIFT_Y;
+
+        } else { 
+            centerX += (w * SHIFT_X * handCos - h * SHIFT_Y * handSin);
+            centerY += (w * SHIFT_X * handSin + h * SHIFT_Y * handCos);
+        }
+
+        float longSide = Max(w, h);
+        float width = (longSide / NN_INPUT_WIDTH) * SCALE_X * NN_INPUT_WIDTH;;
+        float height = (longSide / NN_INPUT_HEIGHT) * SCALE_Y * NN_INPUT_HEIGHT;
+        float cw = handCos * width * 0.5f, ch = handCos * height * 0.5f;
+        float sw = handSin * width * 0.5f, sh = handSin * height * 0.5f;
+
+        HandSize.Set(width, height);
+        HandCenter.Set(centerX, centerY);
+        HandBox[0].Set(centerX + (-cw - -sh), centerY + (-sw + -ch));
+        HandBox[1].Set(centerX + (+cw - -sh), centerY + (+sw + -ch));
+        HandBox[2].Set(centerX + (+cw - +sh), centerY + (+sw + +ch));
+        HandBox[3].Set(centerX + (-cw - +sh), centerY + (-sw + +ch));
+    }
+
+    private Vector3[] landmarks = new Vector3[NN_NUM_LANDMARKS];
+    private void DetecteLandmarksPos() 
+    { 
+        const float NN_THRESHOLD = 0.1f;
+
+        handLandmarksInterpreter.SetInputTensorData(0, handLandmarksInputs);
+
+        float startTimeSeconds = Time.realtimeSinceStartup;
+        handLandmarksInterpreter.Invoke();
+        float inferenceTimeSeconds = (Time.realtimeSinceStartup - startTimeSeconds) * 10000;
+        //Debug.Log(string.Format("Palm detection {0:0.0000} ms", inferenceTimeSeconds));
+
+        Array.Clear(handFlagOutputs, 0, handFlagOutputs.Length);
+        handLandmarksInterpreter.GetOutputTensorData(1, handFlagOutputs);
+
+        if(handFlagOutputs[0, 0] < NN_THRESHOLD){ return; }
+
+        Array.Clear(landmarksOutputs, 0, landmarksOutputs.Length);
+        handLandmarksInterpreter.GetOutputTensorData(0, landmarksOutputs);
+
+        float invW = 1.0f / NN_INPUT_WIDTH, invH = 1.0f / NN_INPUT_HEIGHT;
+        for(int i = 0; i < NN_NUM_LANDMARKS; ++i)
+        { 
+            float x = landmarksOutputs[0, i * 3] * invW;
+            float y = landmarksOutputs[0, i * 3 + 1] * invH;
+            float z = landmarksOutputs[0, i * 3 + 2];
+            landmarks[i].Set(x, y, z);
+         }
+    }
+    private void CalcLandmarksPos()
+    {
+        float w = HandSize.x, h = HandSize.y;
+        for(int i = 0; i < NN_NUM_LANDMARKS; ++i)
+        {
+            float halfX = w * (landmarks[i].x - 0.5f);
+            float halfY = h * (landmarks[i].y - 0.5f);
+            float x = HandCenter.x + (halfX * handCos - halfY * handSin);
+            float y = HandCenter.y + (halfX * handSin + halfY * handCos);
+            float z = landmarks[i].z;
+            HandLandmarks[i].Set(x, y, z);
         }
     }
 
-    private float Sigmoid(float x){ return 1.0f / (1.0f + Exp(-x)); }
- 
     public void Destroy() 
     { 
-        palmDetectionInterpreter.Dispose(); 
-        handLandmark3DInterpreter.Dispose();
+        if(palmDetectionInterpreter != null){ palmDetectionInterpreter.Dispose(); }
+        if(handLandmarksInterpreter != null){ handLandmarksInterpreter.Dispose(); }
     }
 }

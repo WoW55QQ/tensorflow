@@ -18,6 +18,7 @@ using System.Runtime.InteropServices;
 using TfLiteInterpreter = System.IntPtr;
 using TfLiteInterpreterOptions = System.IntPtr;
 using TfLiteDelegate = System.IntPtr;
+using TfLiteGpuDelegateOptions = System.IntPtr;
 using TfLiteModel = System.IntPtr;
 using TfLiteTensor = System.IntPtr;
 using System.Text;
@@ -30,11 +31,13 @@ namespace TensorFlowLite
     /// </summary>
     public class Interpreter : IDisposable
     {
-        private const string TensorFlowLibrary = "tensorflowlite_c";
+        private const string TensorFlowLibrary = "libtensorflowlite_c";
+        private const string TensorFlowLibraryGPU = "libtensorflowlite_gpu_gl";
 
         private TfLiteModel model;
         private TfLiteInterpreter interpreter;
         private TfLiteInterpreterOptions interpreterOptions;
+        private TfLiteDelegate gpuDelegate;
         private const int numThreads = 4;
 
         public Interpreter(byte[] modelData) 
@@ -53,12 +56,18 @@ namespace TensorFlowLite
 
             interpreter = TfLiteInterpreterCreate(model, interpreterOptions);
             if (interpreter == IntPtr.Zero){ throw new Exception("Failed to create TensorFlowLite Interpreter"); }
+
+            //wip
+            //gpuDelegate = GpuDelegateCreate();
         }
 
         ~Interpreter() { Dispose(); }
 
         public void Dispose() 
         {
+            //wip
+            TfLiteGpuDelegateDelete(gpuDelegate); 
+
             if (interpreterOptions != IntPtr.Zero){ TfLiteInterpreterOptionsDelete(interpreterOptions); }
             interpreterOptions = IntPtr.Zero;
 
@@ -93,7 +102,8 @@ namespace TensorFlowLite
 
         public IntPtr GetTensorData(TfLiteTensor tensor) { return TfLiteTensorData(tensor); }
 
-        public string GetTensorName(TfLiteTensor tensor) { 
+        public string GetTensorName(TfLiteTensor tensor) 
+        { 
             byte[] str = new byte[0xFF];
             int count = vsprintf(str, TfLiteTensorName(tensor), IntPtr.Zero);
             return Encoding.ASCII.GetString(str, 0, count);
@@ -118,6 +128,24 @@ namespace TensorFlowLite
             ThrowIfError(TfLiteTensorCopyToBuffer(tensor, tensorDataPtr, Buffer.ByteLength(outputTensorData)));
         }
 
+        public TfLiteDelegate GpuDelegateCreate()
+        { 
+            var glCompileOptions = new TfLiteGlCompileOptions();
+            glCompileOptions.precision_loss_allowed = 1;
+            glCompileOptions.preferred_gl_object_type = (Int32)TfLiteGlObjectType.TFLITE_GL_OBJECT_TYPE_FASTEST;
+            glCompileOptions.dynamic_batch_enabled = 0;
+            glCompileOptions.inline_parameters = 0;
+
+            var gpuDelegateOptions = new TfLiteGpuDelegateOptions();
+            gpuDelegateOptions.metadata = IntPtr.Zero;
+            gpuDelegateOptions.compile_options = glCompileOptions;
+
+            var hoge = TfLiteGpuDelegateCreate(gpuDelegateOptions);
+            return hoge;
+        }
+
+        public void GpuDelegateDelete(TfLiteDelegate gpuDelegate){ TfLiteGpuDelegateDelete(gpuDelegate); }
+
         private static unsafe void ThrowIfError(TfLiteStatus resultCode) 
         {
             if (resultCode != 0)
@@ -135,8 +163,64 @@ namespace TensorFlowLite
         };
         public struct TfLiteQuantizationParams 
         {
-            float scale;
-            Int32 zero_point;
+            public float scale;
+            public Int32 zero_point;
+        };
+        
+        public enum TfLiteGlObjectType
+        {
+            TFLITE_GL_OBJECT_TYPE_FASTEST = 0,
+            TFLITE_GL_OBJECT_TYPE_TEXTURE = 1,
+            TFLITE_GL_OBJECT_TYPE_BUFFER = 2,
+        };
+        public struct TfLiteGlCompileOptions 
+        {
+            public Int32 precision_loss_allowed;
+            public Int32 preferred_gl_object_type;
+            public Int32 dynamic_batch_enabled;
+            public Int32 inline_parameters;
+        };
+        public unsafe struct TfLiteGpuDelegateOptions 
+        {
+            public IntPtr metadata;
+            public TfLiteGlCompileOptions compile_options;
+        };
+
+        public enum TfLiteDelegateFlags 
+        {
+            kTfLiteDelegateFlagsNone = 0,
+            kTfLiteDelegateFlagsAllowDynamicTensors = 1
+        };
+
+        [StructLayout(LayoutKind.Sequential)]
+        public unsafe class TfLiteDelegate 
+        {
+            IntPtr data_;
+
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            public delegate IntPtr TfLiteDelegatePrepare(IntPtr context, IntPtr delegate_);
+            public static IntPtr DelegatePrepare(IntPtr userData, IntPtr delegate_){ return IntPtr.Zero; }
+
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            public delegate TfLiteStatus TfLiteDelegateCopyFromBuffer(IntPtr context, IntPtr delegate_, 
+                                                                      Int32 buffer_handle, IntPtr tensor);
+
+            public static IntPtr DelegateCopyFromBuffer(IntPtr context, IntPtr delegate_, 
+                                                        Int32 buffer_handle, IntPtr tensor){ return IntPtr.Zero; }
+
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            public delegate TfLiteStatus TfLiteDelegateCopyToBuffer(IntPtr context, IntPtr delegate_, 
+                                                                    Int32 buffer_handle, IntPtr tensor);
+
+            public static IntPtr DelegateCopyToBuffer(IntPtr context, IntPtr delegate_, 
+                                                      Int32 buffer_handle, IntPtr tensor){ return IntPtr.Zero; }
+
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            public delegate TfLiteStatus TfLiteDelegateReleaseBuffer(IntPtr context, IntPtr delegate_, Int32 buffer_handle);
+
+            public static IntPtr DelegateReleaseBuffer(IntPtr context, IntPtr delegate_, Int32 buffer_handle){ return IntPtr.Zero; }
+
+            Int64 flags;
         };
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -229,6 +313,14 @@ namespace TensorFlowLite
 
         [DllImport (TensorFlowLibrary)]
         private static extern unsafe TfLiteStatus TfLiteTensorCopyToBuffer(TfLiteTensor tensor, IntPtr outputData, Int32 outputDataSize);
+
+        [DllImport (TensorFlowLibraryGPU)]
+        private static extern unsafe TfLiteDelegate TfLiteGpuDelegateCreate(IntPtr delegateOptions);
+        [DllImport (TensorFlowLibraryGPU)]
+        private static extern unsafe TfLiteDelegate TfLiteGpuDelegateCreate(TfLiteGpuDelegateOptions delegateOptions);
+
+        [DllImport (TensorFlowLibraryGPU)]
+        private static extern unsafe void TfLiteGpuDelegateDelete(TfLiteDelegate delegate_);
 
 #endregion
     }
