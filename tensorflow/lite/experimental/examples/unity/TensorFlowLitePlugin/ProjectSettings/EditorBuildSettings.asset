@@ -4,4 +4,8 @@
 EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
-  m_Scenes: []
+  m_Scenes:
+  - enabled: 1
+    path: Assets/TensorFlowLite/Examples/HandTracking/Scenes/HandTracking.unity
+    guid: dce5de0319a8e2e4dba10bbe076c6400
+  m_configObjects: {}

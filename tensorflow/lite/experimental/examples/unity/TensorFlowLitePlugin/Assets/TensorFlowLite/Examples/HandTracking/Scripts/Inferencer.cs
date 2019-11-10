@@ -40,7 +40,8 @@ public class Inferencer
 
     private float[,,,] palmDetectionInputs = new float[1, NN_INPUT_HEIGHT, NN_INPUT_WIDTH, NN_INPUT_CHANNEL];
     private float[,,,] handLandmarksInputs = new float[1, NN_INPUT_HEIGHT, NN_INPUT_WIDTH, NN_INPUT_CHANNEL];
-
+    
+    private float[] normalizedRGB = new float[256];
     private float[,] anchorsOutputs = new float[NN_NUM_BOXES, NN_NUM_BOX_SIZE];
     private float[,,] regressorsOutputs = new float[1, NN_NUM_BOXES, NN_NUM_COORDS];
     private float[,,] classificatorsOutputs = new float[1, NN_NUM_BOXES, NN_NUM_CLASSES];
@@ -58,16 +59,23 @@ public class Inferencer
     public Vector2[] PalmKeypoints = new Vector2[NN_NUM_KEYPOINTS];
     public Vector3[] HandLandmarks = new Vector3[NN_NUM_LANDMARKS];
 
-    public void Init(TextAsset palmDetection, TextAsset handLandmarks) 
+    public void Init(TextAsset palmDetection, TextAsset handLandmarks, bool useGPU,
+                        int palmDetectionLerpFrameCount, int handLandmark3DLerpFrameCount) 
     {
-        palmDetectionInterpreter = InitInterpreter(palmDetection);
-        handLandmarksInterpreter = InitInterpreter(handLandmarks);
+        palmDetectionInterpreter = InitInterpreter(palmDetection, useGPU);
+        handLandmarksInterpreter = InitInterpreter(handLandmarks, useGPU);
         InitAnchors(anchorsOutputs, NN_INPUT_WIDTH, NN_INPUT_HEIGHT);
+
+        // Image inputs are normalized to [-1,1]
+        const float ItoF = 1.0f / 255.0f;
+        for(int i = 0; i< 256; ++i){ normalizedRGB[i] = (i * ItoF * 2.0f) - 1.0f; }
+
+        lerpPalmRectFrameCount = palmDetectionLerpFrameCount;
+        lerpHandLandmarkFrameCount = handLandmark3DLerpFrameCount;
     }
-    private Interpreter InitInterpreter(TextAsset model)
+    private Interpreter InitInterpreter(TextAsset model, bool useGPU)
     { 
-        Interpreter interpreter = new Interpreter(model.bytes);
-        interpreter.AllocateTensors();
+        var interpreter = new Interpreter(model.bytes, useGPU);
 
         var inputTensorCount = interpreter.GetInputTensorCount();
         for(int i = 0; i < inputTensorCount; ++i){ DebugTensorData(interpreter, interpreter.GetInputTensor(i)); }
@@ -86,7 +94,7 @@ public class Inferencer
         int byteSize = interpreter.GetTensorByteSize(tensor);
         IntPtr data = interpreter.GetTensorData(tensor);
         var name = interpreter.GetTensorName(tensor);
-        Interpreter.TfLiteQuantizationParams tensorQuantizationParams = interpreter.GetTensorQuantizationParams(tensor);
+        var tensorQuantizationParams = interpreter.GetTensorQuantizationParams(tensor);
     }
 
     private void InitAnchors(float[,] anchors, int width, int height)
@@ -126,30 +134,27 @@ public class Inferencer
         var size = new Vector2(texture.width, texture.height);
         var center = new Vector2(size.x * 0.5f, texture.height * 0.5f);
         var angle = 0.0f * Deg2Rad;
+
         CreateShapes(texture, palmDetectionInputs, size, center, angle);
         DetectePalmRect();
         CalcPalmRect();
         CalcHandRect();
+        LerpPalmRect();
 
-        debugHandLandmarks = true;
         CreateShapes(texture, handLandmarksInputs, HandSize, HandCenter, handAngle);
         DetecteLandmarksPos();
         CalcLandmarksPos();
-        debugHandLandmarks = false;
+        LerpLandmarksPos();
 
         Initialized = true;
     }
 
-    private bool debugHandLandmarks = false;
-    private bool shapeFlipX = true;
-    private bool shapeFlipY = true;
-
+    private const bool shapeFlipX = true;
+    private const bool shapeFlipY = true;
     private unsafe void CreateShapes(Texture2D texture, float[,,,] inputs,
                                         Vector2 size, Vector2 center, float angle) 
     {
         const int RGB = 3; // TextureFormat.RGB24
-        const float ItoF = 1.0f / 255.0f;
-
         byte[] pixels = texture.GetRawTextureData();
 
         int srcW = texture.width, srcH = texture.height; 
@@ -159,8 +164,10 @@ public class Inferencer
 
         float longSide = (srcW >= srcH) ? srcW : srcH; 
         float padScaleW = srcW / longSide, padScaleH = srcH / longSide; 
-        int dstPadW = FloorToInt((longSide - srcW) * padScaleW * scaleW * 0.5f); 
-        int dstPadH = FloorToInt((longSide - srcH) * padScaleH * scaleH * 0.5f); 
+        int dstPadW = (int)((longSide - srcW) * padScaleW * scaleW * 0.5f); 
+        int dstPadH = (int)((longSide - srcH) * padScaleH * scaleH * 0.5f); 
+        float invDstH = 1.0f / (dstH - dstPadH * 2.0f);
+        float invDstW = 1.0f / (dstW - dstPadW * 2.0f);
 
         float srcHalfX = (cropW * 0.5f), srcHalfY = (cropH * 0.5f);
         float c = Cos(angle), s = Sin(angle);
@@ -168,33 +175,31 @@ public class Inferencer
         Array.Clear(inputs, 0, inputs.Length);
         fixed (byte* src = pixels) 
         {
-            float invDstH = 1.0f / (dstH - dstPadH * 2.0f);
-            for (int dstY = dstPadH; dstY < dstH - dstPadH; ++dstY) 
+            fixed (float* dst = inputs) 
             {
-                float dstV = (dstY - dstPadH) * invDstH;
-                float srcLocalY = (cropH * dstV) - srcHalfY;
-                float invDstW = 1.0f / (dstW - dstPadW * 2.0f);
-
-                for (int dstX = dstPadW; dstX < dstW - dstPadW; ++dstX) 
+                for (int dstY = dstPadH; dstY < dstH - dstPadH; ++dstY) 
                 {
-                    float dstU = (dstX - dstPadW) * invDstW;
-                    float srcLocalX = (cropW * dstU) - srcHalfX;
-                    int srcGlobalX = FloorToInt(center.x + (srcLocalX * c - srcLocalY * s));
-                    int srcGlobalY = FloorToInt(center.y + (srcLocalX * s + srcLocalY * c));
+                    float dstV = (dstY - dstPadH) * invDstH;
+                    float srcLocalY = (cropH * dstV) - srcHalfY;
 
-                    int srcX = shapeFlipX ? (srcW - 1) - srcGlobalX : srcGlobalX;
-                    int srcY = shapeFlipY ? (srcH - 1) - srcGlobalY : srcGlobalY;
-                    if(srcX < 0 || srcX >= srcW) { continue; }
-                    if(srcY < 0 || srcY >= srcH) { continue; }
+                    float* dstPos = dst + (dstY * dstW + dstPadW) * NN_INPUT_CHANNEL;
+                    for (int dstX = dstPadW; dstX < dstW - dstPadW; ++dstX) 
+                    {
+                        float dstU = (dstX - dstPadW) * invDstW;
+                        float srcLocalX = (cropW * dstU) - srcHalfX;
+                        int srcGlobalX = (int)(center.x + (srcLocalX * c - srcLocalY * s));
+                        int srcGlobalY = (int)(center.y + (srcLocalX * s + srcLocalY * c));
 
-                    byte* srcPos = src + (srcY * srcW + srcX) * RGB;
-                    byte r = *(srcPos++);
-                    byte g = *(srcPos++);
-                    byte b = *(srcPos++);
-                    // Image inputs are normalized to [-1,1]
-                    inputs[0, dstY, dstX, 0] = (r * ItoF * 2.0f) - 1.0f;
-                    inputs[0, dstY, dstX, 1] = (g * ItoF * 2.0f) - 1.0f;
-                    inputs[0, dstY, dstX, 2] = (b * ItoF * 2.0f) - 1.0f;
+                        int srcX = shapeFlipX ? (srcW - 1) - srcGlobalX : srcGlobalX;
+                        int srcY = shapeFlipY ? (srcH - 1) - srcGlobalY : srcGlobalY;
+                        if(srcX < 0 || srcX >= srcW) { continue; }
+                        if(srcY < 0 || srcY >= srcH) { continue; }
+
+                        byte* srcPos = src + (srcY * srcW + srcX) * RGB;
+                        *(dstPos++) = normalizedRGB[*(srcPos++)];
+                        *(dstPos++) = normalizedRGB[*(srcPos++)];
+                        *(dstPos++) = normalizedRGB[*(srcPos++)];
+                    }
                 }
             }
         }
@@ -203,7 +208,7 @@ public class Inferencer
     private float[] palmScoreCandidates = new float[NN_NUM_BOXES];
     private float[,] palmBoxCandidates = new float[NN_NUM_BOXES, NN_NUM_BOX_SIZE];
     private float[,,] palmKeypointsCandidates = new float[NN_NUM_BOXES, NN_NUM_KEYPOINTS, NN_NUM_VALUES_PERKEYPOINT];
-    private float[,] palmBoxMaxScore = new float[1, NN_NUM_BOX_SIZE];
+    private float palmBoxMaxScoreX, palmBoxMaxScoreY, palmBoxMaxScoreW, palmBoxMaxScoreH;
 
     private void DetectePalmRect() 
     { 
@@ -272,32 +277,39 @@ public class Inferencer
 
             if(score < maxScore){ continue; }
             maxScore = score;
-            Array.Copy(palmBoxCandidates, i * NN_NUM_BOX_SIZE, palmBoxMaxScore, 0, NN_NUM_BOX_SIZE);
+            palmBoxMaxScoreX = palmBoxCandidates[i, X];
+            palmBoxMaxScoreY = palmBoxCandidates[i, Y];
+            palmBoxMaxScoreW = palmBoxCandidates[i, W];
+            palmBoxMaxScoreH = palmBoxCandidates[i, H];
         }
     }
     private float Sigmoid(float x){ return 1.0f / (1.0f + Exp(-x)); }
 
+    private float[,] totalKeypoints = new float[NN_NUM_KEYPOINTS, NN_NUM_VALUES_PERKEYPOINT];
     private void CalcPalmRect() 
     { 
         const float MIN_SUPPRESSION_THRESHOLD = 0.3f;
         const int X = 0, Y = 1, W = 2, H = 3;
 
-        float[,] boxCandidate = new float[1, NN_NUM_BOX_SIZE];
+        float totalX = 0.0f, totalY = 0.0f, totalW = 0.0f, totalH = 0.0f;
         float totalScore = 0.0f;
-        float[] totalBox = new float[NN_NUM_BOX_SIZE];
-        float[,] totalKeypoints = new float[NN_NUM_KEYPOINTS, NN_NUM_VALUES_PERKEYPOINT];
+        Array.Clear(totalKeypoints, 0, totalKeypoints.Length);
+
         for(int i = 0; i < NN_NUM_BOXES; ++i)
         {
-            Array.Copy(palmBoxCandidates, i * NN_NUM_BOX_SIZE, boxCandidate, 0, NN_NUM_BOX_SIZE);
-            float similarity = OverlapSimilarity(palmBoxMaxScore, boxCandidate);
+            float score = palmScoreCandidates[i];
+            float x = palmBoxCandidates[i, X];
+            float y = palmBoxCandidates[i, Y];
+            float w = palmBoxCandidates[i, W];
+            float h = palmBoxCandidates[i, H];
+            float similarity = OverlapSimilarity(x, y, w, h);
             if (similarity < MIN_SUPPRESSION_THRESHOLD) { continue; }
 
-            float score = palmScoreCandidates[i];
             totalScore += score;
-            totalBox[X] += palmBoxCandidates[i, X] * score;
-            totalBox[Y] += palmBoxCandidates[i, Y] * score;
-            totalBox[W] += palmBoxCandidates[i, W] * score;
-            totalBox[H] += palmBoxCandidates[i, H] * score;
+            totalX += x * score;
+            totalY += y * score;
+            totalW += w * score;
+            totalH += h * score;
             for(int j = 0; j < NN_NUM_KEYPOINTS; ++j)
             {
                 totalKeypoints[j, 0] += palmKeypointsCandidates[i, j, 0] * score;
@@ -307,8 +319,8 @@ public class Inferencer
 
         if(totalScore == 0.0f) { return; }
         float invTotalScore = 1.0f / totalScore;
-        PalmBox.Set(totalBox[X] * invTotalScore, totalBox[Y] * invTotalScore, 
-                    totalBox[W] * invTotalScore, totalBox[H] * invTotalScore);
+        PalmBox.Set(totalX * invTotalScore, totalY * invTotalScore, 
+                    totalW * invTotalScore, totalH * invTotalScore);
 
         for(int i = 0; i < NN_NUM_KEYPOINTS; ++i)
         {
@@ -316,14 +328,13 @@ public class Inferencer
                                     totalKeypoints[i, 1] * invTotalScore);
         }
     }
-    private float OverlapSimilarity(float[,] a, float[,] b) 
+    private float OverlapSimilarity(float x, float y, float w, float h) 
     {
-        const int X = 0, Y = 1, W = 2, H = 3;
-        float minX = Max(a[0, X], b[0, X]), maxX = Min(a[0, X] + a[0, W], b[0, X] + b[0, W]);
-        float minY = Max(a[0, Y], b[0, Y]), maxY = Min(a[0, Y] + a[0, H], b[0, Y] + b[0, H]);
+        float minX = Max(palmBoxMaxScoreX, x), maxX = Min(palmBoxMaxScoreX + palmBoxMaxScoreW, x + w);
+        float minY = Max(palmBoxMaxScoreY, y), maxY = Min(palmBoxMaxScoreY + palmBoxMaxScoreH, y + h);
         if (minX > maxX || minY > maxY) { return 0.0f; }
 
-        float aArea = a[0, W] * a[0, H], bArea = b[0, W] * b[0, H];
+        float aArea = palmBoxMaxScoreW * palmBoxMaxScoreH, bArea = w * h;
         float intersectionArea = (maxX - minX) * (maxY - minY);
         float normalization = aArea + bArea - intersectionArea;
         if(normalization == 0.0f) { return 0.0f; }
@@ -331,6 +342,47 @@ public class Inferencer
         return intersectionArea / normalization;
     }
  
+    private Rect[] lerpPalmBox = null;
+    private Vector2[,] lerpPalmKeypoints = null;
+    private int lerpPalmRectFrameCount = 3;
+    private int lerpPalmRectFrameNum = 0;
+    private void LerpPalmRect()
+    {
+        if (lerpPalmBox == null) 
+        {
+            lerpPalmBox = new Rect[lerpPalmRectFrameCount];
+            lerpPalmKeypoints = new Vector2[lerpPalmRectFrameCount, NN_NUM_KEYPOINTS];
+            for(int i = 0; i < lerpPalmRectFrameCount; ++i)
+            { 
+                lerpPalmBox[i] = PalmBox;
+                for(int j = 0; j < NN_NUM_KEYPOINTS; ++j) { lerpPalmKeypoints[i, j] = PalmKeypoints[j]; }
+            }
+
+        } else {
+            int i = lerpPalmRectFrameNum;
+            lerpPalmBox[i] = PalmBox;
+            for(int j = 0; j < NN_NUM_KEYPOINTS; ++j) { lerpPalmKeypoints[i, j] = PalmKeypoints[j]; }
+        }
+
+        lerpPalmRectFrameNum = (lerpPalmRectFrameNum + 1) % lerpPalmRectFrameCount;
+
+        PalmBox.Set(0, 0, 0, 0);
+        for(int j = 0; j < NN_NUM_KEYPOINTS; ++j) { PalmKeypoints[j].Set(0, 0); }
+        for(int i = 0; i < lerpPalmRectFrameCount; ++i)
+        { 
+            PalmBox.x += lerpPalmBox[i].x;
+            PalmBox.y += lerpPalmBox[i].y;
+            PalmBox.width += lerpPalmBox[i].width;
+            PalmBox.height += lerpPalmBox[i].height;
+            for(int j = 0; j < NN_NUM_KEYPOINTS; ++j) {  PalmKeypoints[j] += lerpPalmKeypoints[i, j]; }
+        }
+        PalmBox.x /= lerpPalmRectFrameCount;
+        PalmBox.y /= lerpPalmRectFrameCount;
+        PalmBox.width /= lerpPalmRectFrameCount;
+        PalmBox.height /= lerpPalmRectFrameCount;
+        for(int j = 0; j < NN_NUM_KEYPOINTS; ++j) { PalmKeypoints[j] /= lerpPalmRectFrameCount; }
+    }
+
     public Vector2[] HandBox = new Vector2[NN_NUM_BOX_SIZE];
     public Vector2 HandSize, HandCenter;
     private float handAngle = 0.0f;
@@ -422,6 +474,34 @@ public class Inferencer
             float z = landmarks[i].z;
             HandLandmarks[i].Set(x, y, z);
         }
+    }
+
+    private Vector3[,] lerpHandLandmarks = null;
+    private int lerpHandLandmarkFrameCount = 4;
+    private int lerpHandLandmarkFrameNum = 0;
+    private void LerpLandmarksPos()
+    {
+        if (lerpHandLandmarks == null) 
+        {
+            lerpHandLandmarks = new Vector3[lerpHandLandmarkFrameCount, NN_NUM_LANDMARKS];
+            for(int i = 0; i < lerpHandLandmarkFrameCount; ++i)
+            { 
+                for(int j = 0; j < NN_NUM_LANDMARKS; ++j) { lerpHandLandmarks[i, j] = HandLandmarks[j]; }
+            }
+
+        } else {
+            int i = lerpHandLandmarkFrameNum;
+            for(int j = 0; j < NN_NUM_LANDMARKS; ++j) { lerpHandLandmarks[i, j] = HandLandmarks[j]; }
+        }
+
+        lerpHandLandmarkFrameNum = (lerpHandLandmarkFrameNum + 1) % lerpHandLandmarkFrameCount;
+
+        for(int j = 0; j < NN_NUM_LANDMARKS; ++j) { HandLandmarks[j].Set(0, 0, 0); }
+        for(int i = 0; i < lerpHandLandmarkFrameCount; ++i)
+        { 
+            for(int j = 0; j < NN_NUM_LANDMARKS; ++j) {  HandLandmarks[j] += lerpHandLandmarks[i, j]; }
+        }
+        for(int j = 0; j < NN_NUM_LANDMARKS; ++j) {  HandLandmarks[j] /= lerpHandLandmarkFrameCount; }
     }
 
     public void Destroy() 

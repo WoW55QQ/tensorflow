@@ -18,7 +18,6 @@ using System.Runtime.InteropServices;
 using TfLiteInterpreter = System.IntPtr;
 using TfLiteInterpreterOptions = System.IntPtr;
 using TfLiteDelegate = System.IntPtr;
-using TfLiteGpuDelegateOptions = System.IntPtr;
 using TfLiteModel = System.IntPtr;
 using TfLiteTensor = System.IntPtr;
 using System.Text;
@@ -38,9 +37,9 @@ namespace TensorFlowLite
         private TfLiteInterpreter interpreter;
         private TfLiteInterpreterOptions interpreterOptions;
         private TfLiteDelegate gpuDelegate;
-        private const int numThreads = 4;
+        private const int numThreads = 2;
 
-        public Interpreter(byte[] modelData) 
+        public Interpreter(byte[] modelData, bool useGPU = false) 
         {
             GCHandle modelDataHandle = GCHandle.Alloc(modelData, GCHandleType.Pinned);
             IntPtr modelDataPtr = modelDataHandle.AddrOfPinnedObject();
@@ -54,29 +53,39 @@ namespace TensorFlowLite
             TFLInterpreterErrorReporter reporter = InterpreterErrorReporter;
             TfLiteInterpreterOptionsSetErrorReporter(interpreterOptions, reporter, interpreter);
 
+            if(useGPU){ GpuDelegateCreate(); }
+
             interpreter = TfLiteInterpreterCreate(model, interpreterOptions);
-            if (interpreter == IntPtr.Zero){ throw new Exception("Failed to create TensorFlowLite Interpreter"); }
+            if (interpreter == IntPtr.Zero)
+            { 
+                throw new Exception("Failed to create TensorFlowLite Interpreter"); 
+            }
 
-            //wip
-            //gpuDelegate = GpuDelegateCreate();
+            if(!useGPU){ AllocateTensors(); }
         }
 
-        ~Interpreter() { Dispose(); }
+        public void GpuDelegateCreate()
+        { 
+            var glCompileOptions = new TfLiteGlCompileOptions();
+            glCompileOptions.precision_loss_allowed = 0;
+            glCompileOptions.preferred_gl_object_type = (Int32)TfLiteGlObjectType.TFLITE_GL_OBJECT_TYPE_FASTEST;
+            glCompileOptions.dynamic_batch_enabled = 0;
+            glCompileOptions.inline_parameters = 1;
 
-        public void Dispose() 
-        {
-            //wip
-            TfLiteGpuDelegateDelete(gpuDelegate); 
+            var gpuDelegateOptions = new TfLiteGpuDelegateOptions();
+            gpuDelegateOptions.metadata = IntPtr.Zero;
+            gpuDelegateOptions.compile_options = glCompileOptions;
 
-            if (interpreterOptions != IntPtr.Zero){ TfLiteInterpreterOptionsDelete(interpreterOptions); }
-            interpreterOptions = IntPtr.Zero;
-
-            if (interpreter != IntPtr.Zero){ TfLiteInterpreterDelete(interpreter); }
-            interpreter = IntPtr.Zero;
-
-            if (model != IntPtr.Zero){ TfLiteModelDelete(model); }
-            model = IntPtr.Zero;
+            gpuDelegate = TfLiteGpuDelegateCreate(gpuDelegateOptions);
+            if(gpuDelegate == IntPtr.Zero)
+            { 
+                throw new Exception("TensorFlowLite GPU create failed.");
+            }
+            TfLiteInterpreterOptionsAddDelegate(interpreterOptions, gpuDelegate);
         }
+
+        public void GpuDelegateDelete(TfLiteDelegate gpuDelegate){ TfLiteGpuDelegateDelete(gpuDelegate); }
+
 
         public void ResizeInputTensor(int inputTensorIndex, int[] inputTensorShape) 
         {
@@ -128,30 +137,29 @@ namespace TensorFlowLite
             ThrowIfError(TfLiteTensorCopyToBuffer(tensor, tensorDataPtr, Buffer.ByteLength(outputTensorData)));
         }
 
-        public TfLiteDelegate GpuDelegateCreate()
-        { 
-            var glCompileOptions = new TfLiteGlCompileOptions();
-            glCompileOptions.precision_loss_allowed = 1;
-            glCompileOptions.preferred_gl_object_type = (Int32)TfLiteGlObjectType.TFLITE_GL_OBJECT_TYPE_FASTEST;
-            glCompileOptions.dynamic_batch_enabled = 0;
-            glCompileOptions.inline_parameters = 0;
-
-            var gpuDelegateOptions = new TfLiteGpuDelegateOptions();
-            gpuDelegateOptions.metadata = IntPtr.Zero;
-            gpuDelegateOptions.compile_options = glCompileOptions;
-
-            var hoge = TfLiteGpuDelegateCreate(gpuDelegateOptions);
-            return hoge;
-        }
-
-        public void GpuDelegateDelete(TfLiteDelegate gpuDelegate){ TfLiteGpuDelegateDelete(gpuDelegate); }
-
         private static unsafe void ThrowIfError(TfLiteStatus resultCode) 
         {
-            if (resultCode != 0)
+            if (resultCode != TfLiteStatus.kTfLiteOk)
             {
                 throw new Exception("TensorFlowLite operation failed.");
             }
+        }
+
+        ~Interpreter() { Dispose(); }
+
+        public void Dispose() 
+        {
+//wip
+//            if(gpuDelegate != null){ TfLiteGpuDelegateDelete(gpuDelegate); }
+
+            if (interpreterOptions != IntPtr.Zero){ TfLiteInterpreterOptionsDelete(interpreterOptions); }
+            interpreterOptions = IntPtr.Zero;
+
+            if (interpreter != IntPtr.Zero){ TfLiteInterpreterDelete(interpreter); }
+            interpreter = IntPtr.Zero;
+
+            if (model != IntPtr.Zero){ TfLiteModelDelete(model); }
+            model = IntPtr.Zero;
         }
 
 #region Externs
@@ -190,37 +198,6 @@ namespace TensorFlowLite
         {
             kTfLiteDelegateFlagsNone = 0,
             kTfLiteDelegateFlagsAllowDynamicTensors = 1
-        };
-
-        [StructLayout(LayoutKind.Sequential)]
-        public unsafe class TfLiteDelegate 
-        {
-            IntPtr data_;
-
-            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-            public delegate IntPtr TfLiteDelegatePrepare(IntPtr context, IntPtr delegate_);
-            public static IntPtr DelegatePrepare(IntPtr userData, IntPtr delegate_){ return IntPtr.Zero; }
-
-            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-            public delegate TfLiteStatus TfLiteDelegateCopyFromBuffer(IntPtr context, IntPtr delegate_, 
-                                                                      Int32 buffer_handle, IntPtr tensor);
-
-            public static IntPtr DelegateCopyFromBuffer(IntPtr context, IntPtr delegate_, 
-                                                        Int32 buffer_handle, IntPtr tensor){ return IntPtr.Zero; }
-
-            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-            public delegate TfLiteStatus TfLiteDelegateCopyToBuffer(IntPtr context, IntPtr delegate_, 
-                                                                    Int32 buffer_handle, IntPtr tensor);
-
-            public static IntPtr DelegateCopyToBuffer(IntPtr context, IntPtr delegate_, 
-                                                      Int32 buffer_handle, IntPtr tensor){ return IntPtr.Zero; }
-
-            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-            public delegate TfLiteStatus TfLiteDelegateReleaseBuffer(IntPtr context, IntPtr delegate_, Int32 buffer_handle);
-
-            public static IntPtr DelegateReleaseBuffer(IntPtr context, IntPtr delegate_, Int32 buffer_handle){ return IntPtr.Zero; }
-
-            Int64 flags;
         };
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -314,8 +291,6 @@ namespace TensorFlowLite
         [DllImport (TensorFlowLibrary)]
         private static extern unsafe TfLiteStatus TfLiteTensorCopyToBuffer(TfLiteTensor tensor, IntPtr outputData, Int32 outputDataSize);
 
-        [DllImport (TensorFlowLibraryGPU)]
-        private static extern unsafe TfLiteDelegate TfLiteGpuDelegateCreate(IntPtr delegateOptions);
         [DllImport (TensorFlowLibraryGPU)]
         private static extern unsafe TfLiteDelegate TfLiteGpuDelegateCreate(TfLiteGpuDelegateOptions delegateOptions);
 

@@ -1,235 +1,105 @@
-﻿using System;
-using System.Collections;
-using System.Collections.Generic;
-using UnityEngine;
+﻿using UnityEngine;
 
-using static UnityEngine.Mathf;
+public class DebugRenderer : MonoBehaviour 
+{
+    private float width = 0.0f, height = 0.0f;
+    private float invWidth = 0.0f, invHeight = 0.0f;
+    private GameObject plane;
 
-public class DebugRenderer : MonoBehaviour {
-    private float planeScale = 0.039f;
-    private float planePos = -5.0f;
-    private const float circleRad = 0.1f;
-
-    private int width = 0, height = 0;
-    private Material lineMaterial;
-
-    public void Init(int width, int height) 
+    public void Init(int width, int height, GameObject plane) 
     { 
         this.width = width; 
-        this.height = height; 
+        this.height = height;
+        this.plane = plane;
+        invWidth = 1.0f / width;
+        invHeight = 1.0f / height;
     }
 
-    private void CreateLineMaterial() 
+    private GameObject[] sphere = null;
+    private GameObject[] cylinder = null;
+
+    public void DrawHand3D(Vector3[] landmarks) 
     {
-        if (lineMaterial) { return; }
-
-        Shader shader = Shader.Find("Hidden/Internal-Colored");
-        lineMaterial = new Material(shader);
-        lineMaterial.hideFlags = HideFlags.HideAndDontSave;
-        lineMaterial.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-        lineMaterial.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-        lineMaterial.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
-        lineMaterial.SetInt("_ZWrite", 0);
-    }
-
-    private float FitPlane(float pos) { return pos * planeScale + planePos; }
-
-    private float AdjScale(float pos, float src, float dst) 
-    {
-        float scale = src / dst;
-        float center = dst / 2.0f;
-        return (pos - center) * scale + center; 
-    }
-
-    private void DrawBegin() 
-    {
-        CreateLineMaterial();
-        lineMaterial.SetPass(0);
-        GL.PushMatrix();
-        GL.MultMatrix(transform.localToWorldMatrix);
-    }
-    private void DrawEnd() { GL.PopMatrix(); }
-
-    private void DrawCircle(float x, float y, float theta)
-    { 
-        float posX = FitPlane(x) + Cos(theta) * circleRad;
-        float posY = FitPlane(y) + Sin(theta) * circleRad;
-        GL.Vertex3(posX, 0.0f, posY);
-    }
-
-    public void DrawInput(float[,,,] inputs) 
-    {
-        Color color = Color.black;
-        Color padding = Color.gray;
-        Color cleared = Color.black;
-
-        DrawBegin();
-        for (int y = 0; y < height; ++y) 
-        {
-            GL.Begin(GL.LINE_STRIP);
-            for (int x = 0; x < width; ++x) 
-            {
-                color.r = inputs[0, y, x, 0] * 0.5f + 0.5f;
-                color.g = inputs[0, y, x, 1] * 0.5f + 0.5f;
-                color.b = inputs[0, y, x, 2] * 0.5f + 0.5f;
-                color.a = 1.0f;
-
-//                if(color == padding) { continue; }
-//                if(color == cleared) { continue; }
-
-                GL.Color(color);
-                GL.Vertex3(FitPlane(x), 0.0f, FitPlane(y));
-            }
-            GL.End();
-        }
-        DrawEnd();
-    }
-
-    public void DrawPalm(Rect box, Vector2[] keypoints, Vector2[] handBox, Vector2 handCenter) 
-    {
-        DrawBegin();
-
-        // Palm rect
-        var xMin = box.x * width;
-        var xMax = (box.x + box.width) * width;
-        var yMin = box.y * height;
-        var yMax = (box.y + box.height) * height;
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.green);
-        GL.Vertex3(FitPlane(xMin), 0.0f, FitPlane(yMin));
-        GL.Vertex3(FitPlane(xMin), 0.0f, FitPlane(yMax));
-        GL.Vertex3(FitPlane(xMax), 0.0f, FitPlane(yMax));
-        GL.Vertex3(FitPlane(xMax), 0.0f, FitPlane(yMin));
-        GL.Vertex3(FitPlane(xMin), 0.0f, FitPlane(yMin));
-        GL.End();
-
-        // Palm keypoints
-        for(int i = 0; i < keypoints.Length; ++i)
+        if(sphere == null) 
         { 
-            GL.Begin(GL.LINES);
-            GL.Color(Color.blue);
-            for (float theta = 0.0f; theta < (2.0f * PI); theta += 0.01f) 
+            float diameter = 0.25f;
+            var scale = new Vector3(diameter, diameter, diameter);
+            sphere = new GameObject[landmarks.Length]; 
+            for(int i = 0; i < landmarks.Length; ++i)
             {
-                float x = keypoints[i].x * width;
-                float y = keypoints[i].y * height;
-                DrawCircle(x, y, theta);
+                sphere[i] = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                sphere[i].name = "Sphere" + i.ToString();
+                sphere[i].transform.localScale = scale;
+                Material mat = sphere[i].GetComponent<Renderer>().material; 
+                mat.color = Color.red; 
             }
-            GL.End();
         }
-
-        float scaleX = 0.0f;
-
-        // Hand rect center
-        GL.Begin(GL.LINES);
-        GL.Color(Color.yellow);
-        for (float theta = 0.0f; theta < (2.0f * PI); theta += 0.01f) 
-        {
-            DrawCircle(handCenter.x + scaleX, handCenter.y, theta);
-        }
-        GL.End();
-
-        float srcW = 256.0f * 1.25f, dstW = 256.0f;
-        float srcH = 256.0f * 1.25f, dstH = 256.0f;
-
-        // Hand rect
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.red);
-        GL.Vertex3(FitPlane(handBox[0].x), 0.0f, FitPlane(handBox[0].y));
-        GL.Vertex3(FitPlane(handBox[1].x), 0.0f, FitPlane(handBox[1].y));
-        GL.Vertex3(FitPlane(handBox[2].x), 0.0f, FitPlane(handBox[2].y));
-        GL.Vertex3(FitPlane(handBox[3].x), 0.0f, FitPlane(handBox[3].y));
-        GL.Vertex3(FitPlane(handBox[0].x), 0.0f, FitPlane(handBox[0].y));
-
-        GL.End();
-
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.blue);
-        GL.Vertex3(FitPlane(0), 0.0f, FitPlane(0));
-        GL.Vertex3(FitPlane(0), 0.0f, FitPlane(255));
-        GL.Vertex3(FitPlane(255), 0.0f, FitPlane(255));
-        GL.Vertex3(FitPlane(255), 0.0f, FitPlane(0));
-        GL.Vertex3(FitPlane(0), 0.0f, FitPlane(0));
-        GL.End();
-
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.blue);
-        GL.Vertex3(FitPlane(64), 0.0f, FitPlane(0));
-        GL.Vertex3(FitPlane(64), 0.0f, FitPlane(255));
-        GL.Vertex3(FitPlane(255 - 64), 0.0f, FitPlane(255));
-        GL.Vertex3(FitPlane(255 - 64), 0.0f, FitPlane(0));
-        GL.Vertex3(FitPlane(64), 0.0f, FitPlane(0));
-        GL.End();
-
-        DrawEnd();
-    }
-    public void DrawHand(Vector3[] landmarks) 
-    {
-        DrawBegin();
 
         for(int i = 0; i < landmarks.Length; ++i)
         {
+            var camera = Camera.main;
+            var cameraPos = camera.transform.position;
+            var planePos = plane.transform.position;
             var landmark = landmarks[i];
-            GL.Begin(GL.LINE_STRIP);
-            GL.Color(Color.red);
-            for (float theta = 0.0f; theta < (2.0f * PI); theta += 0.01f) 
-            {
-                DrawCircle(landmark.x, landmark.y, theta);
-            }
-            GL.End();
+            var depth = landmark.z / 64.0f;
+
+            float x = (width - landmark.x) * invWidth * Screen.width;
+            float y = (height - landmark.y) * invHeight * Screen.height;
+            float z = (cameraPos.z - planePos.z) - 0.5f +  depth;
+            var pos =  camera.ScreenToWorldPoint(new Vector3(x, y, z));
+            sphere[i].transform.localPosition = pos;
         }
 
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.blue);
-        GL.Vertex3(FitPlane(landmarks[0].x), 0.0f, FitPlane(landmarks[0].y));
-        GL.Vertex3(FitPlane(landmarks[1].x), 0.0f, FitPlane(landmarks[1].y));
-        GL.Vertex3(FitPlane(landmarks[2].x), 0.0f, FitPlane(landmarks[2].y));
-        GL.Vertex3(FitPlane(landmarks[3].x), 0.0f, FitPlane(landmarks[3].y));
-        GL.Vertex3(FitPlane(landmarks[4].x), 0.0f, FitPlane(landmarks[4].y));
-        GL.End();
+        if(cylinder == null) 
+        { 
+            cylinder = new GameObject[landmarks.Length]; 
+            for(int i = 0; i < landmarks.Length; ++i)
+            {
+                cylinder[i] = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                cylinder[i].name = "Cylinder" + i.ToString();
+                cylinder[i].transform.localScale = Vector3.zero;
+                Material mat = cylinder[i].GetComponent<Renderer>().material;
+                mat.color = Color.white;
+            }
+        }
 
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.blue);
-        GL.Vertex3(FitPlane(landmarks[0].x), 0.0f, FitPlane(landmarks[0].y));
-        GL.Vertex3(FitPlane(landmarks[5].x), 0.0f, FitPlane(landmarks[5].y));
-        GL.Vertex3(FitPlane(landmarks[6].x), 0.0f, FitPlane(landmarks[6].y));
-        GL.Vertex3(FitPlane(landmarks[7].x), 0.0f, FitPlane(landmarks[7].y));
-        GL.Vertex3(FitPlane(landmarks[8].x), 0.0f, FitPlane(landmarks[8].y));
-        GL.End();
+        UpdateCylinder(0, 0, 1);
+        UpdateCylinder(1, 1, 2);
+        UpdateCylinder(2, 2, 3);
+        UpdateCylinder(3, 3, 4);
 
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.blue);
-        GL.Vertex3(FitPlane(landmarks[5].x), 0.0f, FitPlane(landmarks[5].y));
-        GL.Vertex3(FitPlane(landmarks[9].x), 0.0f, FitPlane(landmarks[9].y));
-        GL.Vertex3(FitPlane(landmarks[10].x), 0.0f, FitPlane(landmarks[10].y));
-        GL.Vertex3(FitPlane(landmarks[11].x), 0.0f, FitPlane(landmarks[11].y));
-        GL.Vertex3(FitPlane(landmarks[12].x), 0.0f, FitPlane(landmarks[12].y));
-        GL.End();
+        UpdateCylinder(4, 0, 5);
+        UpdateCylinder(5, 5, 6);
+        UpdateCylinder(6, 6, 7);
+        UpdateCylinder(7, 7, 8);
 
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.blue);
-        GL.Vertex3(FitPlane(landmarks[9].x), 0.0f, FitPlane(landmarks[9].y));
-        GL.Vertex3(FitPlane(landmarks[13].x), 0.0f, FitPlane(landmarks[13].y));
-        GL.Vertex3(FitPlane(landmarks[14].x), 0.0f, FitPlane(landmarks[14].y));
-        GL.Vertex3(FitPlane(landmarks[15].x), 0.0f, FitPlane(landmarks[15].y));
-        GL.Vertex3(FitPlane(landmarks[16].x), 0.0f, FitPlane(landmarks[16].y));
-        GL.End();
+        UpdateCylinder(8, 5, 9);
+        UpdateCylinder(9, 9, 10);
+        UpdateCylinder(10, 10, 11);
+        UpdateCylinder(11, 11, 12);
 
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.blue);
-        GL.Vertex3(FitPlane(landmarks[13].x), 0.0f, FitPlane(landmarks[13].y));
-        GL.Vertex3(FitPlane(landmarks[17].x), 0.0f, FitPlane(landmarks[17].y));
-        GL.End();
+        UpdateCylinder(12, 9, 13);
+        UpdateCylinder(13, 13, 14);
+        UpdateCylinder(14, 14, 15);
+        UpdateCylinder(15, 15, 16);
 
-        GL.Begin(GL.LINE_STRIP);
-        GL.Color(Color.blue);
-        GL.Vertex3(FitPlane(landmarks[0].x), 0.0f, FitPlane(landmarks[0].y));
-        GL.Vertex3(FitPlane(landmarks[17].x), 0.0f, FitPlane(landmarks[17].y));
-        GL.Vertex3(FitPlane(landmarks[18].x), 0.0f, FitPlane(landmarks[18].y));
-        GL.Vertex3(FitPlane(landmarks[19].x), 0.0f, FitPlane(landmarks[19].y));
-        GL.Vertex3(FitPlane(landmarks[20].x), 0.0f, FitPlane(landmarks[20].y));
-        GL.End();
+        UpdateCylinder(16, 13, 17);
 
-        DrawEnd();
+        UpdateCylinder(17, 0, 17);
+        UpdateCylinder(18, 17, 18);
+        UpdateCylinder(19, 18, 19);
+        UpdateCylinder(20, 19, 20);
     }
-
+    private void UpdateCylinder(int target, int sphere1, int sphere2) 
+    {
+        float diameter = 0.15f;
+        var s1 = sphere[sphere1].transform.position;
+        var s2 = sphere[sphere2].transform.position;
+        var position = (s1 + s2) * 0.5f;
+        var rotate = Quaternion.FromToRotation(Vector3.up, (s1 - s2).normalized);
+        var scale = new Vector3(diameter, (s1 - s2).magnitude * 0.5f, diameter);
+        cylinder[target].transform.localPosition = position;
+        cylinder[target].transform.localRotation = rotate;
+        cylinder[target].transform.localScale = scale;
+    }
 }

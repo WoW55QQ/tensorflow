@@ -12,7 +12,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-using System.Collections;
 using UnityEngine;
 using UnityEngine.Video;
 
@@ -23,29 +22,33 @@ public class HandTracking : MonoBehaviour
     public int InputH = 256;
     public TextAsset PalmDetection;
     public TextAsset HandLandmark3D;
-
+    public int PalmDetectionLerpFrameCount = 3;
+    public int HandLandmark3DLerpFrameCount = 4;
+    public bool UseGPU = true;
     private RenderTexture videoTexture;
     private Texture2D texture;
-    private bool isPosing = false;
 
     private Inferencer inferencer = new Inferencer();
-    private DebugRenderer renderer;
+    private GameObject debugPlane;
+    private DebugRenderer debugRenderer;
 
     void Awake() { QualitySettings.vSyncCount = 0; }
 
     void Start() 
     {
         InitTexture();
-        inferencer.Init(PalmDetection, HandLandmark3D);
-        renderer = GameObject.Find("TensorFlowLite").GetComponent<DebugRenderer>();
-        renderer.Init(inferencer.InputWidth, inferencer.InputHeight);
+        inferencer.Init(PalmDetection, HandLandmark3D, UseGPU, 
+                        PalmDetectionLerpFrameCount, HandLandmark3DLerpFrameCount);
+        debugPlane = GameObject.Find("TensorFlowLite");
+        debugRenderer = debugPlane.GetComponent<DebugRenderer>();
+        debugRenderer.Init(inferencer.InputWidth, inferencer.InputHeight, debugPlane);
     }
     private void InitTexture()
     { 
-        RectTransform rectTransform = GetComponent<RectTransform>();
-        Renderer renderer = GetComponent<Renderer>();
+        var rectTransform = GetComponent<RectTransform>();
+        var renderer = GetComponent<Renderer>();
 
-        VideoPlayer videoPlayer = GetComponent<VideoPlayer>();
+        var videoPlayer = GetComponent<VideoPlayer>();
         int width = (int)rectTransform.rect.width;
         int height = (int)rectTransform.rect.height;
         videoTexture = new RenderTexture(width, height, 24);
@@ -58,43 +61,24 @@ public class HandTracking : MonoBehaviour
 
     void Update() 
     {
-        if (isPosing) { return; }
-        isPosing = true;
-        StartCoroutine("UpdateInferencer", texture);
-    }
-
-    IEnumerator UpdateInferencer(Texture2D texture) 
-    {
         Graphics.SetRenderTarget(videoTexture);
         texture.ReadPixels(new Rect(0, 0, videoTexture.width, videoTexture.height), 0, 0);
         texture.Apply();
         Graphics.SetRenderTarget(null);
 
         inferencer.Update(texture);
-
-        isPosing = false;
-        yield return null;
     }
 
     public void OnRenderObject() 
     {
         if (!inferencer.Initialized){ return; }
 
-        var palmDetectionInputs = inferencer.PalmDetectionInputs;
-        //renderer.DrawInput(palmDetectionInputs);
-
-        var palmBox = inferencer.PalmBox;
-        var palmKeypoints = inferencer.PalmKeypoints;
-        var handBox = inferencer.HandBox;
-        var handCenter = inferencer.HandCenter;
-        //Debug.Log(string.Format("Palm box {0:0.0}, {1:0.0}, {2:0.0}, {3:0.0}", palmBox.x, palmBox.y, palmBox.width, palmBox.height));
-        //renderer.DrawPalm(palmBox, palmKeypoints, handBox, handCenter);
-
-        var handLandmarksInputs = inferencer.HandLandmarksInputs;
-        //renderer.DrawInput(handLandmarksInputs);
-
-        var handLandmarks = inferencer.HandLandmarks;
-        renderer.DrawHand(handLandmarks);
+        bool debugHandLandmarks3D = true;
+        if (debugHandLandmarks3D)
+        { 
+            var handLandmarks = inferencer.HandLandmarks;
+            debugRenderer.DrawHand3D(handLandmarks);
+        }
     }
 
     void OnDestroy(){ inferencer.Destroy(); }
